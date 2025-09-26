@@ -149,6 +149,6 @@ async fn http_client_connects_and_receives_notifications() -> Result<()> {
 
     drop(client);
     shutdown_tx.send(()).ok();
-    server_handle.await.ok();
+    server_handle.await.unwrap();
     Ok(())
 }
