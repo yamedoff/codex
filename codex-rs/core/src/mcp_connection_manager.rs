@@ -20,6 +20,7 @@ use mcp_types::Tool;
 
 use sha1::Digest;
 use sha1::Sha1;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::debug;
@@ -177,21 +178,31 @@ impl McpConnectionManager {
                     let mut notifications = client.subscribe_notifications();
                     let server_name_clone = server_name.clone();
                     let notification_task = tokio::spawn(async move {
-                        while let Ok(notification) = notifications.recv().await {
-                            match serde_json::to_value(&notification) {
-                                Ok(value) => {
-                                    debug!(
+                        loop {
+                            match notifications.recv().await {
+                                Ok(notification) => match serde_json::to_value(&notification) {
+                                    Ok(value) => {
+                                        debug!(
+                                            server = %server_name_clone,
+                                            notification = %value,
+                                            "received MCP notification"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        debug!(
+                                            server = %server_name_clone,
+                                            "received MCP notification"
+                                        );
+                                    }
+                                },
+                                Err(RecvError::Lagged(skipped)) => {
+                                    warn!(
                                         server = %server_name_clone,
-                                        notification = %value,
-                                        "received MCP notification"
+                                        skipped = skipped,
+                                        "skipped MCP notifications due to lag"
                                     );
                                 }
-                                Err(_) => {
-                                    debug!(
-                                        server = %server_name_clone,
-                                        "received MCP notification"
-                                    );
-                                }
+                                Err(RecvError::Closed) => break,
                             }
                         }
                     });
