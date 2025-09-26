@@ -303,7 +303,7 @@ fn codex_client_info() -> ClientInfo {
 
 fn parse_protocol_version(version: &str) -> ProtocolVersion {
     serde_json::from_str::<ProtocolVersion>(&format!("\"{version}\""))
-        .unwrap_or(ProtocolVersion::LATEST)
+        .expect("hardcoded MCP_SCHEMA_VERSION should be valid")
 }
 
 fn convert_value<T, U>(value: T) -> Result<U>
