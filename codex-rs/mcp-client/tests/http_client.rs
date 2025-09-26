@@ -116,11 +116,12 @@ async fn http_client_connects_and_receives_notifications() -> Result<()> {
     let addr = listener.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server_handle = tokio::spawn(async move {
-        let _ = axum::serve(listener, router)
+        axum::serve(listener, router)
             .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
+                shutdown_rx.await.expect("shutdown signal receiver error");
             })
-            .await;
+            .await
+            .expect("axum server error");
     });
 
     let url = format!("http://{addr}/mcp");
