@@ -16,14 +16,13 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_mcp_client::McpClient;
-use mcp_types::ClientCapabilities;
-use mcp_types::Implementation;
 use mcp_types::Tool;
 
-use serde_json::json;
 use sha1::Digest;
 use sha1::Sha1;
 use tokio::task::JoinSet;
+use tokio::time::timeout;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
@@ -89,6 +88,8 @@ struct ManagedClient {
     client: Arc<McpClient>,
     startup_timeout: Duration,
     tool_timeout: Option<Duration>,
+    #[allow(dead_code)]
+    _notification_task: tokio::task::JoinHandle<()>,
 }
 
 /// A thin wrapper around a set of running [`McpClient`] instances.
@@ -144,50 +145,18 @@ impl McpConnectionManager {
                 let McpServerConfig {
                     command, args, env, ..
                 } = cfg;
-                let client_res = McpClient::new_stdio_client(
+                let spawn_future = McpClient::spawn_stdio(
                     command.into(),
                     args.into_iter().map(OsString::from).collect(),
                     env,
-                )
-                .await;
-                match client_res {
-                    Ok(client) => {
-                        // Initialize the client.
-                        let params = mcp_types::InitializeRequestParams {
-                            capabilities: ClientCapabilities {
-                                experimental: None,
-                                roots: None,
-                                sampling: None,
-                                // https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation#capabilities
-                                // indicates this should be an empty object.
-                                elicitation: Some(json!({})),
-                            },
-                            client_info: Implementation {
-                                name: "codex-mcp-client".to_owned(),
-                                version: env!("CARGO_PKG_VERSION").to_owned(),
-                                title: Some("Codex".into()),
-                                // This field is used by Codex when it is an MCP
-                                // server: it should not be used when Codex is
-                                // an MCP client.
-                                user_agent: None,
-                            },
-                            protocol_version: mcp_types::MCP_SCHEMA_VERSION.to_owned(),
-                        };
-                        let initialize_notification_params = None;
-                        let init_result = client
-                            .initialize(
-                                params,
-                                initialize_notification_params,
-                                Some(startup_timeout),
-                            )
-                            .await;
-                        (
-                            (server_name, tool_timeout),
-                            init_result.map(|_| (client, startup_timeout)),
-                        )
-                    }
-                    Err(e) => ((server_name, tool_timeout), Err(e.into())),
-                }
+                    startup_timeout,
+                );
+                let client_res = timeout(startup_timeout, spawn_future).await;
+                let client_res = match client_res {
+                    Ok(result) => result.map(|client| (client, startup_timeout)),
+                    Err(_) => Err(anyhow!("timeout while starting MCP server `{server_name}`")),
+                };
+                ((server_name, tool_timeout), client_res)
             });
         }
 
@@ -204,12 +173,35 @@ impl McpConnectionManager {
 
             match client_res {
                 Ok((client, startup_timeout)) => {
+                    let client = Arc::new(client);
+                    let mut notifications = client.subscribe_notifications();
+                    let server_name_clone = server_name.clone();
+                    let notification_task = tokio::spawn(async move {
+                        while let Ok(notification) = notifications.recv().await {
+                            match serde_json::to_value(&notification) {
+                                Ok(value) => {
+                                    debug!(
+                                        server = %server_name_clone,
+                                        notification = %value,
+                                        "received MCP notification"
+                                    );
+                                }
+                                Err(_) => {
+                                    debug!(
+                                        server = %server_name_clone,
+                                        "received MCP notification"
+                                    );
+                                }
+                            }
+                        }
+                    });
                     clients.insert(
                         server_name,
                         ManagedClient {
-                            client: Arc::new(client),
+                            client,
                             startup_timeout,
                             tool_timeout: Some(tool_timeout),
+                            _notification_task: notification_task,
                         },
                     );
                 }
@@ -281,7 +273,7 @@ async fn list_all_tools(clients: &HashMap<String, ManagedClient>) -> Result<Vec<
         let client_clone = managed_client.client.clone();
         let startup_timeout = managed_client.startup_timeout;
         join_set.spawn(async move {
-            let res = client_clone.list_tools(None, Some(startup_timeout)).await;
+            let res = timeout(startup_timeout, client_clone.list_all_tools()).await;
             (server_name_cloned, res)
         });
     }
@@ -296,14 +288,19 @@ async fn list_all_tools(clients: &HashMap<String, ManagedClient>) -> Result<Vec<
             continue;
         };
 
-        let list_result = if let Ok(result) = list_result {
-            result
-        } else {
-            warn!("Failed to list tools for MCP server '{server_name}': {list_result:#?}");
-            continue;
+        let tools = match list_result {
+            Ok(Ok(tools)) => tools,
+            Ok(Err(err)) => {
+                warn!("Failed to list tools for MCP server '{server_name}': {err:#}");
+                continue;
+            }
+            Err(err) => {
+                warn!("Failed to list tools for MCP server '{server_name}': {err:#}");
+                continue;
+            }
         };
 
-        for tool in list_result.tools {
+        for tool in tools {
             let tool_info = ToolInfo {
                 server_name: server_name.clone(),
                 tool_name: tool.name.clone(),

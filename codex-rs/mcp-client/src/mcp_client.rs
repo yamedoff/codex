@@ -1,406 +1,326 @@
-//! A minimal async client for the Model Context Protocol (MCP).
+//! Client utilities for interacting with Model Context Protocol (MCP) servers.
 //!
-//! The client is intentionally lightweight – it is only capable of:
-//!   1. Spawning a subprocess that launches a conforming MCP server that
-//!      communicates over stdio.
-//!   2. Sending MCP requests and pairing them with their corresponding
-//!      responses.
-//!   3. Offering a convenience helper for the common `tools/list` request.
-//!
-//! The crate hides all JSON‐RPC framing details behind a typed API. Users
-//! interact with the [`ModelContextProtocolRequest`] trait from `mcp-types` to
-//! issue requests and receive strongly-typed results.
+//! This module wraps the `rmcp` SDK so Codex can rely on the upstream
+//! JSON-RPC handling, transports, and helpers instead of maintaining bespoke
+//! plumbing.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::Arc;
-use std::sync::atomic::AtomicI64;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
-use mcp_types::CallToolRequest;
-use mcp_types::CallToolRequestParams;
-use mcp_types::InitializeRequest;
-use mcp_types::InitializeRequestParams;
-use mcp_types::InitializedNotification;
-use mcp_types::JSONRPC_VERSION;
-use mcp_types::JSONRPCMessage;
-use mcp_types::JSONRPCNotification;
-use mcp_types::JSONRPCRequest;
-use mcp_types::JSONRPCResponse;
-use mcp_types::ListToolsRequest;
-use mcp_types::ListToolsRequestParams;
-use mcp_types::ListToolsResult;
-use mcp_types::ModelContextProtocolNotification;
-use mcp_types::ModelContextProtocolRequest;
-use mcp_types::RequestId;
+use rmcp::ErrorData as McpError;
+use rmcp::model::CallToolRequest;
+use rmcp::model::CallToolRequestParam;
+use rmcp::model::ClientCapabilities;
+use rmcp::model::ClientInfo;
+use rmcp::model::ClientNotification;
+use rmcp::model::ClientRequest;
+use rmcp::model::ClientResult;
+use rmcp::model::CreateElicitationResult;
+use rmcp::model::CreateMessageRequestMethod;
+use rmcp::model::ElicitationAction;
+use rmcp::model::ElicitationCapability;
+use rmcp::model::Implementation;
+use rmcp::model::JsonObject;
+use rmcp::model::ListRootsResult;
+use rmcp::model::ProtocolVersion;
+use rmcp::model::ServerNotification;
+use rmcp::model::ServerRequest;
+use rmcp::model::ServerResult;
+use rmcp::service::NotificationContext;
+use rmcp::service::Peer;
+use rmcp::service::PeerRequestOptions;
+use rmcp::service::RequestContext;
+use rmcp::service::RoleClient;
+use rmcp::service::RunningService;
+use rmcp::service::Service;
+use rmcp::service::ServiceExt;
+use rmcp::transport::ConfigureCommandExt;
+use rmcp::transport::IntoTransport;
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::TokioChildProcess;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::io::BufReader;
-use tokio::process::Command;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
-use tokio::time;
+use tokio::sync::broadcast;
+use tokio::time::timeout;
 use tracing::debug;
-use tracing::error;
-use tracing::info;
-use tracing::warn;
 
-/// Capacity of the bounded channels used for transporting messages between the
-/// client API and the IO tasks.
-const CHANNEL_CAPACITY: usize = 128;
+const NOTIFICATION_CHANNEL_CAPACITY: usize = 128;
 
-/// Internal representation of a pending request sender.
-type PendingSender = oneshot::Sender<JSONRPCMessage>;
-
-/// A running MCP client instance.
+/// A running MCP client backed by the upstream `rmcp` SDK.
+#[derive(Clone)]
 pub struct McpClient {
-    /// Retain this child process until the client is dropped. The Tokio runtime
-    /// will make a "best effort" to reap the process after it exits, but it is
-    /// not a guarantee. See the `kill_on_drop` documentation for details.
-    #[allow(dead_code)]
-    child: tokio::process::Child,
+    inner: Arc<McpClientInner>,
+}
 
-    /// Channel for sending JSON-RPC messages *to* the background writer task.
-    outgoing_tx: mpsc::Sender<JSONRPCMessage>,
-
-    /// Map of `request.id -> oneshot::Sender` used to dispatch responses back
-    /// to the originating caller.
-    pending: Arc<Mutex<HashMap<i64, PendingSender>>>,
-
-    /// Monotonically increasing counter used to generate request IDs.
-    id_counter: AtomicI64,
+struct McpClientInner {
+    running_service: RunningService<RoleClient, CodexClientService>,
+    notifications: broadcast::Sender<ServerNotification>,
 }
 
 impl McpClient {
-    /// Spawn the given command and establish an MCP session over its STDIO.
-    /// Caller is responsible for sending the `initialize` request. See
-    /// [`initialize`](Self::initialize) for details.
-    pub async fn new_stdio_client(
+    /// Spawn an MCP server as a subprocess and connect over stdio.
+    pub async fn spawn_stdio(
         program: OsString,
         args: Vec<OsString>,
         env: Option<HashMap<String, String>>,
-    ) -> std::io::Result<Self> {
-        let mut child = Command::new(program)
+        timeout_duration: Duration,
+    ) -> Result<Self> {
+        let mut command = tokio::process::Command::new(program);
+        command
             .args(args)
             .env_clear()
-            .envs(create_env_for_mcp_server(env))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            // As noted in the `kill_on_drop` documentation, the Tokio runtime makes
-            // a "best effort" to reap-after-exit to avoid zombie processes, but it
-            // is not a guarantee.
-            .kill_on_drop(true)
-            .spawn()?;
+            .envs(create_env_for_mcp_server(env));
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("failed to capture child stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| std::io::Error::other("failed to capture child stdout"))?;
+        let transport = TokioChildProcess::new(command.configure(|cmd| {
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::inherit());
+            cmd.kill_on_drop(true);
+        }))?;
 
-        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<JSONRPCMessage>(CHANNEL_CAPACITY);
-        let pending: Arc<Mutex<HashMap<i64, PendingSender>>> = Arc::new(Mutex::new(HashMap::new()));
-
-        // Spawn writer task. It listens on the `outgoing_rx` channel and
-        // writes messages to the child's STDIN.
-        let writer_handle = {
-            let mut stdin = stdin;
-            tokio::spawn(async move {
-                while let Some(msg) = outgoing_rx.recv().await {
-                    match serde_json::to_string(&msg) {
-                        Ok(json) => {
-                            debug!("MCP message to server: {json}");
-                            if stdin.write_all(json.as_bytes()).await.is_err() {
-                                error!("failed to write message to child stdin");
-                                break;
-                            }
-                            if stdin.write_all(b"\n").await.is_err() {
-                                error!("failed to write newline to child stdin");
-                                break;
-                            }
-                            // No explicit flush needed on a pipe; write_all is sufficient.
-                        }
-                        Err(e) => error!("failed to serialize JSONRPCMessage: {e}"),
-                    }
-                }
-            })
-        };
-
-        // Spawn reader task. It reads line-delimited JSON from the child's
-        // STDOUT and dispatches responses to the pending map.
-        let reader_handle = {
-            let pending = pending.clone();
-            let mut lines = BufReader::new(stdout).lines();
-
-            tokio::spawn(async move {
-                while let Ok(Some(line)) = lines.next_line().await {
-                    debug!("MCP message from server: {line}");
-                    match serde_json::from_str::<JSONRPCMessage>(&line) {
-                        Ok(JSONRPCMessage::Response(resp)) => {
-                            Self::dispatch_response(resp, &pending).await;
-                        }
-                        Ok(JSONRPCMessage::Error(err)) => {
-                            Self::dispatch_error(err, &pending).await;
-                        }
-                        Ok(JSONRPCMessage::Notification(JSONRPCNotification { .. })) => {
-                            // For now we only log server-initiated notifications.
-                            info!("<- notification: {}", line);
-                        }
-                        Ok(other) => {
-                            // Batch responses and requests are currently not
-                            // expected from the server – log and ignore.
-                            info!("<- unhandled message: {:?}", other);
-                        }
-                        Err(e) => {
-                            error!("failed to deserialize JSONRPCMessage: {e}; line = {}", line)
-                        }
-                    }
-                }
-            })
-        };
-
-        // We intentionally *detach* the tasks. They will keep running in the
-        // background as long as their respective resources (channels/stdin/
-        // stdout) are alive. Dropping `McpClient` cancels the tasks due to
-        // dropped resources.
-        let _ = (writer_handle, reader_handle);
-
-        Ok(Self {
-            child,
-            outgoing_tx,
-            pending,
-            id_counter: AtomicI64::new(1),
-        })
+        Self::start_with_transport(transport, timeout_duration).await
     }
 
-    /// Send an arbitrary MCP request and await the typed result.
-    ///
-    /// If `timeout` is `None` the call waits indefinitely. If `Some(duration)`
-    /// is supplied and no response is received within the given period, a
-    /// timeout error is returned.
-    pub async fn send_request<R>(
-        &self,
-        params: R::Params,
-        timeout: Option<Duration>,
-    ) -> Result<R::Result>
-    where
-        R: ModelContextProtocolRequest,
-        R::Params: Serialize,
-        R::Result: DeserializeOwned,
-    {
-        // Create a new unique ID.
-        let id = self.id_counter.fetch_add(1, Ordering::SeqCst);
-        let request_id = RequestId::Integer(id);
+    /// Connect to an MCP server over HTTP+SSE using the streamable transport.
+    pub async fn connect_http(
+        uri: impl Into<String>,
+        client: Option<reqwest::Client>,
+        headers: Option<reqwest::header::HeaderMap>,
+        transport_config: Option<StreamableHttpClientTransportConfig>,
+        timeout_duration: Duration,
+    ) -> Result<Self> {
+        use reqwest::header::AUTHORIZATION;
+        use std::sync::Arc as StdArc;
 
-        // Serialize params -> JSON. For many request types `Params` is
-        // `Option<T>` and `None` should be encoded as *absence* of the field.
-        let params_json = serde_json::to_value(&params)?;
-        let params_field = if params_json.is_null() {
-            None
-        } else {
-            Some(params_json)
-        };
+        let uri_string = uri.into();
+        let uri_arc: StdArc<str> = StdArc::from(uri_string.as_str());
 
-        let jsonrpc_request = JSONRPCRequest {
-            id: request_id.clone(),
-            jsonrpc: JSONRPC_VERSION.to_string(),
-            method: R::METHOD.to_string(),
-            params: params_field,
-        };
+        let mut config = transport_config
+            .unwrap_or_else(|| StreamableHttpClientTransportConfig::with_uri(uri_arc.clone()));
+        config.uri = uri_arc.clone();
 
-        let message = JSONRPCMessage::Request(jsonrpc_request);
-
-        // oneshot channel for the response.
-        let (tx, rx) = oneshot::channel();
-
-        // Register in pending map *before* sending the message so a race where
-        // the response arrives immediately cannot be lost.
+        if let Some(value) = headers
+            .as_ref()
+            .and_then(|map| map.get(AUTHORIZATION))
+            .and_then(|value| value.to_str().ok())
         {
-            let mut guard = self.pending.lock().await;
-            guard.insert(id, tx);
+            config = config.auth_header(value.to_owned());
         }
 
-        // Send to writer task.
-        if self.outgoing_tx.send(message).await.is_err() {
-            return Err(anyhow!(
-                "failed to send message to writer task - channel closed"
-            ));
-        }
-
-        // Await the response, optionally bounded by a timeout.
-        let msg = match timeout {
-            Some(duration) => {
-                match time::timeout(duration, rx).await {
-                    Ok(Ok(msg)) => msg,
-                    Ok(Err(_)) => {
-                        // Channel closed without a reply – remove the pending entry.
-                        let mut guard = self.pending.lock().await;
-                        guard.remove(&id);
-                        return Err(anyhow!(
-                            "response channel closed before a reply was received"
-                        ));
-                    }
-                    Err(_) => {
-                        // Timed out. Remove the pending entry so we don't leak.
-                        let mut guard = self.pending.lock().await;
-                        guard.remove(&id);
-                        return Err(anyhow!("request timed out"));
-                    }
+        let client = match client {
+            Some(existing) => existing,
+            None => {
+                let mut builder = reqwest::Client::builder();
+                if let Some(headers) = headers.clone() {
+                    builder = builder.default_headers(headers);
                 }
+                builder.build().context("building reqwest client")?
             }
-            None => rx
-                .await
-                .map_err(|_| anyhow!("response channel closed before a reply was received"))?,
         };
 
-        match msg {
-            JSONRPCMessage::Response(JSONRPCResponse { result, .. }) => {
-                let typed: R::Result = serde_json::from_value(result)?;
-                Ok(typed)
-            }
-            JSONRPCMessage::Error(err) => Err(anyhow!(format!(
-                "server returned JSON-RPC error: code = {}, message = {}",
-                err.error.code, err.error.message
-            ))),
-            other => Err(anyhow!(format!(
-                "unexpected message variant received in reply path: {:?}",
-                other
-            ))),
-        }
+        let transport = StreamableHttpClientTransport::with_client(client, config);
+        Self::start_with_transport(transport, timeout_duration).await
     }
 
-    pub async fn send_notification<N>(&self, params: N::Params) -> Result<()>
-    where
-        N: ModelContextProtocolNotification,
-        N::Params: Serialize,
-    {
-        // Serialize params -> JSON. For many request types `Params` is
-        // `Option<T>` and `None` should be encoded as *absence* of the field.
-        let params_json = serde_json::to_value(&params)?;
-        let params_field = if params_json.is_null() {
-            None
-        } else {
-            Some(params_json)
-        };
+    /// Subscribe to notifications emitted by the connected server.
+    pub fn subscribe_notifications(&self) -> broadcast::Receiver<ServerNotification> {
+        self.inner.notifications.subscribe()
+    }
 
-        let method = N::METHOD.to_string();
-        let jsonrpc_notification = JSONRPCNotification {
-            jsonrpc: JSONRPC_VERSION.to_string(),
-            method: method.clone(),
-            params: params_field,
-        };
-
-        let notification = JSONRPCMessage::Notification(jsonrpc_notification);
-        self.outgoing_tx
-            .send(notification)
+    /// List every tool exposed by the server, automatically following pagination.
+    pub async fn list_all_tools(&self) -> Result<Vec<mcp_types::Tool>> {
+        let tools = self
+            .peer()
+            .list_all_tools()
             .await
-            .with_context(|| format!("failed to send notification `{method}` to writer task"))
+            .map_err(|err| anyhow!(err))?;
+        tools.into_iter().map(convert_value).collect()
     }
 
-    /// Negotiates the initialization with the MCP server. Sends an `initialize`
-    /// request with the specified `initialize_params` and then the
-    /// `notifications/initialized` notification once the response has been
-    /// received. Returns the response to the `initialize` request.
-    pub async fn initialize(
-        &self,
-        initialize_params: InitializeRequestParams,
-        initialize_notification_params: Option<serde_json::Value>,
-        timeout: Option<Duration>,
-    ) -> Result<mcp_types::InitializeResult> {
-        let response = self
-            .send_request::<InitializeRequest>(initialize_params, timeout)
-            .await?;
-        self.send_notification::<InitializedNotification>(initialize_notification_params)
-            .await?;
-        Ok(response)
-    }
-
-    /// Convenience wrapper around `tools/list`.
-    pub async fn list_tools(
-        &self,
-        params: Option<ListToolsRequestParams>,
-        timeout: Option<Duration>,
-    ) -> Result<ListToolsResult> {
-        self.send_request::<ListToolsRequest>(params, timeout).await
-    }
-
-    /// Convenience wrapper around `tools/call`.
+    /// Invoke a tool by name with optional JSON arguments.
     pub async fn call_tool(
         &self,
-        name: String,
+        tool_name: String,
         arguments: Option<serde_json::Value>,
-        timeout: Option<Duration>,
+        timeout_duration: Option<Duration>,
     ) -> Result<mcp_types::CallToolResult> {
-        let params = CallToolRequestParams { name, arguments };
-        debug!("MCP tool call: {params:?}");
-        self.send_request::<CallToolRequest>(params, timeout).await
-    }
+        let params = CallToolRequestParam {
+            name: tool_name.clone().into(),
+            arguments: arguments
+                .map(value_to_json_object)
+                .transpose()
+                .with_context(|| format!("invalid arguments for tool `{tool_name}`"))?,
+        };
 
-    /// Internal helper: route a JSON-RPC *response* object to the pending map.
-    async fn dispatch_response(
-        resp: JSONRPCResponse,
-        pending: &Arc<Mutex<HashMap<i64, PendingSender>>>,
-    ) {
-        let id = match resp.id {
-            RequestId::Integer(i) => i,
-            RequestId::String(_) => {
-                // We only ever generate integer IDs. Receiving a string here
-                // means we will not find a matching entry in `pending`.
-                error!("response with string ID - no matching pending request");
-                return;
+        let result = if let Some(timeout_duration) = timeout_duration {
+            let request = CallToolRequest::new(params.clone());
+            let handle = self
+                .peer()
+                .send_request_with_option(
+                    ClientRequest::CallToolRequest(request),
+                    PeerRequestOptions {
+                        timeout: Some(timeout_duration),
+                        meta: None,
+                    },
+                )
+                .await
+                .map_err(|err| anyhow!(err))?;
+            match handle.await_response().await.map_err(|err| anyhow!(err))? {
+                ServerResult::CallToolResult(result) => result,
+                other => return Err(anyhow!("unexpected response variant: {other:?}")),
             }
+        } else {
+            self.peer()
+                .call_tool(params)
+                .await
+                .map_err(|err| anyhow!(err))?
         };
 
-        let tx_opt = {
-            let mut guard = pending.lock().await;
-            guard.remove(&id)
-        };
-        if let Some(tx) = tx_opt {
-            // Ignore send errors – the receiver might have been dropped.
-            let _ = tx.send(JSONRPCMessage::Response(resp));
-        } else {
-            warn!(id, "no pending request found for response");
-        }
+        convert_value(result)
     }
 
-    /// Internal helper: route a JSON-RPC *error* object to the pending map.
-    async fn dispatch_error(
-        err: mcp_types::JSONRPCError,
-        pending: &Arc<Mutex<HashMap<i64, PendingSender>>>,
-    ) {
-        let id = match err.id {
-            RequestId::Integer(i) => i,
-            RequestId::String(_) => return, // see comment above
-        };
+    /// Send an arbitrary request to the server using raw MCP model types.
+    pub async fn send_request(&self, request: ClientRequest) -> Result<ServerResult> {
+        self.peer()
+            .send_request(request)
+            .await
+            .map_err(|err| anyhow!(err))
+    }
 
-        let tx_opt = {
-            let mut guard = pending.lock().await;
-            guard.remove(&id)
-        };
-        if let Some(tx) = tx_opt {
-            let _ = tx.send(JSONRPCMessage::Error(err));
+    /// Send a notification to the server using raw MCP model types.
+    pub async fn send_notification(&self, notification: ClientNotification) -> Result<()> {
+        self.peer()
+            .send_notification(notification)
+            .await
+            .map_err(|err| anyhow!(err))
+    }
+
+    fn peer(&self) -> &Peer<RoleClient> {
+        self.inner.running_service.peer()
+    }
+
+    async fn start_with_transport<T, E, A>(transport: T, timeout_duration: Duration) -> Result<Self>
+    where
+        T: IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let (notifications, _) = broadcast::channel(NOTIFICATION_CHANNEL_CAPACITY);
+        let service = CodexClientService::new(notifications.clone());
+        let running_service = timeout(timeout_duration, service.serve(transport))
+            .await
+            .map_err(|_| anyhow!("timed out waiting for MCP client initialization"))?
+            .map_err(|err| anyhow!(err))?;
+
+        Ok(Self {
+            inner: Arc::new(McpClientInner {
+                running_service,
+                notifications,
+            }),
+        })
+    }
+}
+
+struct CodexClientService {
+    client_info: ClientInfo,
+    notifications: broadcast::Sender<ServerNotification>,
+}
+
+impl CodexClientService {
+    fn new(notifications: broadcast::Sender<ServerNotification>) -> Self {
+        Self {
+            client_info: codex_client_info(),
+            notifications,
         }
     }
 }
 
-impl Drop for McpClient {
-    fn drop(&mut self) {
-        // Even though we have already tagged this process with
-        // `kill_on_drop(true)` above, this extra check has the benefit of
-        // forcing the process to be reaped immediately if it has already exited
-        // instead of waiting for the Tokio runtime to reap it later.
-        let _ = self.child.try_wait();
+impl Service<RoleClient> for CodexClientService {
+    async fn handle_request(
+        &self,
+        request: ServerRequest,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<ClientResult, McpError> {
+        match request {
+            ServerRequest::PingRequest(_) => Ok(ClientResult::empty(())),
+            ServerRequest::CreateMessageRequest(_) => {
+                Err(McpError::method_not_found::<CreateMessageRequestMethod>())
+            }
+            ServerRequest::ListRootsRequest(_) => {
+                Ok(ClientResult::ListRootsResult(ListRootsResult::default()))
+            }
+            ServerRequest::CreateElicitationRequest(_) => Ok(
+                ClientResult::CreateElicitationResult(CreateElicitationResult {
+                    action: ElicitationAction::Decline,
+                    content: None,
+                }),
+            ),
+        }
+    }
+
+    fn handle_notification(
+        &self,
+        notification: ServerNotification,
+        _context: NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<(), McpError>> + Send + '_ {
+        let tx = self.notifications.clone();
+        async move {
+            if let Err(err) = tx.send(notification) {
+                debug!("dropping server notification; no active subscribers: {err}");
+            }
+            Ok(())
+        }
+    }
+
+    fn get_info(&self) -> ClientInfo {
+        self.client_info.clone()
+    }
+}
+
+fn codex_client_info() -> ClientInfo {
+    ClientInfo {
+        protocol_version: parse_protocol_version(mcp_types::MCP_SCHEMA_VERSION),
+        capabilities: ClientCapabilities {
+            experimental: None,
+            roots: None,
+            sampling: None,
+            elicitation: Some(ElicitationCapability::default()),
+        },
+        client_info: Implementation {
+            name: "codex-mcp-client".to_owned(),
+            title: Some("Codex".to_owned()),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            icons: None,
+            website_url: None,
+        },
+    }
+}
+
+fn parse_protocol_version(version: &str) -> ProtocolVersion {
+    serde_json::from_str::<ProtocolVersion>(&format!("\"{version}\""))
+        .unwrap_or(ProtocolVersion::LATEST)
+}
+
+fn convert_value<T, U>(value: T) -> Result<U>
+where
+    T: Serialize,
+    U: DeserializeOwned,
+{
+    let json = serde_json::to_value(value)?;
+    Ok(serde_json::from_value(json)?)
+}
+
+fn value_to_json_object(value: serde_json::Value) -> Result<JsonObject> {
+    match value {
+        serde_json::Value::Object(map) => Ok(map),
+        other => Err(anyhow!(
+            "expected arguments to be a JSON object, got {other}"
+        )),
     }
 }
 
@@ -409,23 +329,12 @@ impl Drop for McpClient {
 #[rustfmt::skip]
 #[cfg(unix)]
 const DEFAULT_ENV_VARS: &[&str] = &[
-    // https://modelcontextprotocol.io/docs/tools/debugging#environment-variables
-    // states:
-    //
-    // > MCP servers inherit only a subset of environment variables automatically,
-    // > like `USER`, `HOME`, and `PATH`.
-    //
-    // But it does not fully enumerate the list. Empirically, when spawning a
-    // an MCP server via Claude Desktop on macOS, it reports the following
-    // environment variables:
     "HOME",
     "LOGNAME",
     "PATH",
     "SHELL",
     "USER",
     "__CF_USER_TEXT_ENCODING",
-
-    // Additional environment variables Codex chooses to include by default:
     "LANG",
     "LC_ALL",
     "TERM",
@@ -435,7 +344,6 @@ const DEFAULT_ENV_VARS: &[&str] = &[
 
 #[cfg(windows)]
 const DEFAULT_ENV_VARS: &[&str] = &[
-    // TODO: More research is necessary to curate this list.
     "PATH",
     "PATHEXT",
     "USERNAME",
@@ -463,6 +371,7 @@ fn create_env_for_mcp_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_create_env_for_mcp_server() {

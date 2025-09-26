@@ -1,34 +1,86 @@
 //! Simple command-line utility to exercise `McpClient`.
-//!
-//! Example usage:
-//!
-//! ```bash
-//! cargo run -p codex-mcp-client -- `codex-mcp-server`
-//! ```
-//!
-//! Any additional arguments after the first one are forwarded to the spawned
-//! program. The utility connects, issues a `tools/list` request and prints the
-//! server's response as pretty JSON.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
+use clap::ArgAction;
+use clap::Parser;
 use codex_mcp_client::McpClient;
-use mcp_types::ClientCapabilities;
-use mcp_types::Implementation;
-use mcp_types::InitializeRequestParams;
-use mcp_types::ListToolsRequestParams;
-use mcp_types::MCP_SCHEMA_VERSION;
+use reqwest::header::HeaderMap;
+use reqwest::header::HeaderName;
+use reqwest::header::HeaderValue;
 use tracing_subscriber::EnvFilter;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "codex-mcp-client",
+    about = "Interact with MCP servers over stdio or HTTP"
+)]
+struct Cli {
+    /// Connect to an MCP server over HTTP instead of spawning a subprocess.
+    #[arg(long)]
+    http: Option<String>,
+
+    /// Additional HTTP headers to include when connecting over HTTP.
+    #[arg(long = "header", value_parser = parse_header, value_name = "NAME:VALUE")]
+    headers: Vec<(HeaderName, HeaderValue)>,
+
+    /// Additional environment variables to pass to the spawned MCP server.
+    #[arg(long = "env", value_parser = parse_key_val, value_name = "NAME=VALUE")]
+    env: Vec<(String, String)>,
+
+    /// Timeout (seconds) for establishing the connection.
+    #[arg(long, default_value_t = 10)]
+    timeout_secs: u64,
+
+    /// Program (and optional arguments) to run when using stdio transport.
+    #[arg(value_name = "PROGRAM", trailing_var_arg = true, action = ArgAction::Append)]
+    args: Vec<OsString>,
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_tracing();
+    let cli = Cli::parse();
+    let timeout = Duration::from_secs(cli.timeout_secs);
+
+    let client = if let Some(url) = cli.http {
+        let mut header_map = HeaderMap::new();
+        for (name, value) in cli.headers {
+            header_map.insert(name, value);
+        }
+        McpClient::connect_http(url, None, Some(header_map), None, timeout)
+            .await
+            .context("failed to connect to HTTP MCP server")?
+    } else {
+        let mut args = cli.args;
+        if args.is_empty() {
+            anyhow::bail!(
+                "Usage: codex-mcp-client <program> [args..]\n\nExample: codex-mcp-client codex-mcp-server"
+            );
+        }
+        let program = args.remove(0);
+        let env: HashMap<String, String> = cli.env.into_iter().collect();
+        McpClient::spawn_stdio(program, args, Some(env), timeout)
+            .await
+            .context("failed to spawn subprocess")?
+    };
+
+    let tools = client
+        .list_all_tools()
+        .await
+        .context("tools/list request failed")?;
+    println!("{}", serde_json::to_string_pretty(&tools)?);
+
+    Ok(())
+}
+
+fn init_tracing() {
     let default_level = "debug";
     let _ = tracing_subscriber::fmt()
-        // Fallback to the `default_level` log filter if the environment
-        // variable is not set _or_ contains an invalid value
         .with_env_filter(
             EnvFilter::try_from_default_env()
                 .or_else(|_| EnvFilter::try_new(default_level))
@@ -36,56 +88,22 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .try_init();
+}
 
-    // Collect command-line arguments excluding the program name itself.
-    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+fn parse_key_val(s: &str) -> Result<(String, String)> {
+    let (key, value) = s
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("expected NAME=VALUE, got {s}"))?;
+    Ok((key.to_owned(), value.to_owned()))
+}
 
-    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
-        eprintln!("Usage: mcp-client <program> [args..]\n\nExample: mcp-client codex-mcp-server");
-        std::process::exit(1);
-    }
-    let original_args = args.clone();
-
-    // Spawn the subprocess and connect the client.
-    let program = args.remove(0);
-    let env = None;
-    let client = McpClient::new_stdio_client(program, args, env)
-        .await
-        .with_context(|| format!("failed to spawn subprocess: {original_args:?}"))?;
-
-    let params = InitializeRequestParams {
-        capabilities: ClientCapabilities {
-            experimental: None,
-            roots: None,
-            sampling: None,
-            elicitation: None,
-        },
-        client_info: Implementation {
-            name: "codex-mcp-client".to_owned(),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            title: Some("Codex".to_string()),
-            // This field is used by Codex when it is an MCP server: it should
-            // not be used when Codex is an MCP client.
-            user_agent: None,
-        },
-        protocol_version: MCP_SCHEMA_VERSION.to_owned(),
-    };
-    let initialize_notification_params = None;
-    let timeout = Some(Duration::from_secs(10));
-    let response = client
-        .initialize(params, initialize_notification_params, timeout)
-        .await?;
-    eprintln!("initialize response: {response:?}");
-
-    // Issue `tools/list` request (no params).
-    let timeout = None;
-    let tools = client
-        .list_tools(None::<ListToolsRequestParams>, timeout)
-        .await
-        .context("tools/list request failed")?;
-
-    // Print the result in a human readable form.
-    println!("{}", serde_json::to_string_pretty(&tools)?);
-
-    Ok(())
+fn parse_header(s: &str) -> Result<(HeaderName, HeaderValue)> {
+    let (name, value) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected NAME:VALUE, got {s}"))?;
+    let header_name = HeaderName::try_from(name.trim())
+        .map_err(|err| anyhow::anyhow!("invalid header name `{name}`: {err}"))?;
+    let header_value = HeaderValue::try_from(value.trim())
+        .map_err(|err| anyhow::anyhow!("invalid header value `{value}`: {err}"))?;
+    Ok((header_name, header_value))
 }
