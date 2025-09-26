@@ -172,11 +172,11 @@ impl McpClient {
                 .await
                 .map_err(|err| anyhow!(err))?;
 
-            match handle.await_response().await {
-                Ok(ServerResult::CallToolResult(result)) => result,
-                Ok(other) => return Err(anyhow!("unexpected response variant: {other:?}")),
-                Err(err) => return Err(anyhow!(err)),
-            }
+            let server_result = handle.await_response().await.map_err(anyhow::Error::from)?;
+            let ServerResult::CallToolResult(result) = server_result else {
+                return Err(anyhow!("unexpected response variant: {server_result:?}"));
+            };
+            result
         } else {
             self.peer()
                 .call_tool(params)
