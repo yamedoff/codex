@@ -158,13 +158,24 @@ impl McpClient {
                 .with_context(|| format!("invalid arguments for tool `{tool_name}`"))?,
         };
 
-            match tokio::time::timeout(timeout_duration, handle.await_response()).await {
-                Ok(Ok(ServerResult::CallToolResult(result))) => result,
-                Ok(Ok(other)) => return Err(anyhow!("unexpected response variant: {other:?}")),
-                Ok(Err(err)) => return Err(anyhow!(err)),
-                Err(_) => return Err(anyhow!("request timed out")),
-            }
-                other => return Err(anyhow!("unexpected response variant: {other:?}")),
+        let result = if let Some(timeout_duration) = timeout_duration {
+            let request = CallToolRequest::new(params.clone());
+            let handle = self
+                .peer()
+                .send_cancellable_request(
+                    ClientRequest::CallToolRequest(request),
+                    PeerRequestOptions {
+                        timeout: Some(timeout_duration),
+                        ..PeerRequestOptions::default()
+                    },
+                )
+                .await
+                .map_err(|err| anyhow!(err))?;
+
+            match handle.await_response().await {
+                Ok(ServerResult::CallToolResult(result)) => result,
+                Ok(other) => return Err(anyhow!("unexpected response variant: {other:?}")),
+                Err(err) => return Err(anyhow!(err)),
             }
         } else {
             self.peer()
