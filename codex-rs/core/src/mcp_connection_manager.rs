@@ -20,6 +20,7 @@ use mcp_types::Tool;
 
 use sha1::Digest;
 use sha1::Sha1;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::debug;
@@ -177,21 +178,32 @@ impl McpConnectionManager {
                     let mut notifications = client.subscribe_notifications();
                     let server_name_clone = server_name.clone();
                     let notification_task = tokio::spawn(async move {
-                        while let Ok(notification) = notifications.recv().await {
-                            match serde_json::to_value(&notification) {
-                                Ok(value) => {
-                                    debug!(
+                        loop {
+                            match notifications.recv().await {
+                                Ok(notification) => match serde_json::to_value(&notification) {
+                                    Ok(value) => {
+                                        debug!(
+                                            server = %server_name_clone,
+                                            notification = %value,
+                                            "received MCP notification"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        debug!(
+                                            server = %server_name_clone,
+                                            "received MCP notification"
+                                        );
+                                    }
+                                },
+                                Err(RecvError::Lagged(skipped)) => {
+                                    warn!(
                                         server = %server_name_clone,
-                                        notification = %value,
-                                        "received MCP notification"
+                                        skipped,
+                                        "dropped lagged MCP notifications"
                                     );
+                                    continue;
                                 }
-                                Err(_) => {
-                                    debug!(
-                                        server = %server_name_clone,
-                                        "received MCP notification"
-                                    );
-                                }
+                                Err(RecvError::Closed) => break,
                             }
                         }
                     });
@@ -411,5 +423,47 @@ mod tests {
             keys[1],
             "my_server__yet_another_e1c3987bd9c50b826cbe1687966f79f0c602d19ca"
         );
+    }
+
+    #[tokio::test]
+    async fn notification_task_continues_after_lagged_messages() {
+        use tokio::sync::broadcast;
+        use tokio::sync::broadcast::error::RecvError;
+        use tokio::time::Duration;
+        use tokio::time::timeout;
+
+        const CAPACITY: usize = 128;
+        let (sender, mut receiver) = broadcast::channel::<usize>(CAPACITY);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+
+        let notification_task = tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(value) => {
+                        if value == usize::MAX {
+                            let _ = done_tx.send(());
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                }
+            }
+        });
+
+        for i in 0..=CAPACITY {
+            sender.send(i).expect("send lagging value");
+        }
+
+        sender.send(usize::MAX).expect("send sentinel notification");
+
+        timeout(Duration::from_secs(1), done_rx)
+            .await
+            .expect("notification task should finish")
+            .expect("notification task should report completion");
+
+        notification_task
+            .await
+            .expect("notification task should not panic");
     }
 }
